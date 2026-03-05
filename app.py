@@ -8,31 +8,28 @@ import random
 import string
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from telebot import types
-from apscheduler.schedulers.background import BackgroundScheduler
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==============================
 # CONFIGURATION
 # ==============================
-# Replace with your actual Token and Admin ID
 API_TOKEN = '8660919886:AAGLJAactunzCrv-lKRO1o-GjiBgLDGEbxI'
 ADMIN_ID = 8373846582
 
 bot = telebot.TeleBot(API_TOKEN)
-scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.start()
 
 # ==============================
-# DATABASE SETUP
+# DATABASE SETUP (with last_checked)
 # ==============================
 def init_db():
     conn = sqlite3.connect('uptime.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS monitors 
                       (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, url TEXT, 
-                       interval INTEGER, status TEXT DEFAULT 'UNKNOWN', fail_count INTEGER DEFAULT 0)''')
+                       interval INTEGER, status TEXT DEFAULT 'UNKNOWN', fail_count INTEGER DEFAULT 0,
+                       last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')  # new column
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, is_verified INTEGER DEFAULT 0)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS access_codes (code TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, monitor_id INTEGER, status TEXT, detail TEXT, timestamp TEXT)''')
@@ -42,7 +39,7 @@ def init_db():
 db_conn = init_db()
 
 # ==============================
-# MONITORING ENGINE
+# MONITORING ENGINE (same as before)
 # ==============================
 def ping_url(monitor_id, url, user_id):
     regions = ["🇺🇸 US-East", "🇪🇺 EU-West", "🇸🇬 SG-Core", "🇯🇵 JP-Tokyo", "🇧🇩 BD-Khulna", "🇰🇷 KA-North"]
@@ -78,7 +75,8 @@ def ping_url(monitor_id, url, user_id):
     if 0 < new_fail_count < 3:
         final_status = "UP" 
 
-    cursor.execute("UPDATE monitors SET status=?, fail_count=? WHERE id=?", (final_status, new_fail_count, monitor_id))
+    cursor.execute("UPDATE monitors SET status=?, fail_count=?, last_checked=? WHERE id=?", 
+                   (final_status, new_fail_count, datetime.now(), monitor_id))
     cursor.execute("INSERT INTO logs (monitor_id, status, detail, timestamp) VALUES (?, ?, ?, ?)", 
                    (monitor_id, status, detail, now))
     db_conn.commit()
@@ -89,7 +87,30 @@ def ping_url(monitor_id, url, user_id):
         except: pass
 
 # ==============================
-# HELPERS
+# CRON ENDPOINT – প্রতি মিনিটে external cron job এটি কল করবে
+# ==============================
+def run_cron_tasks():
+    """এখন যেসব মণিটরের interval পেরিয়েছে তাদের চেক করে"""
+    cursor = db_conn.cursor()
+    # সব monitor নিয়ে আসি
+    cursor.execute("SELECT id, url, interval, user_id, last_checked FROM monitors WHERE interval > 0")
+    monitors = cursor.fetchall()
+    now = datetime.now()
+    for mon in monitors:
+        mid, url, interval, uid, last_checked_str = mon
+        # last_checked কে datetime-এ রূপান্তর
+        if last_checked_str:
+            last_checked = datetime.fromisoformat(last_checked_str)
+        else:
+            last_checked = datetime.min  # যদি NULL হয়
+        # পরবর্তী চেকের সময় = last_checked + interval মিনিট
+        next_check = last_checked + timedelta(minutes=interval)
+        if now >= next_check:
+            # চেক চালাও (thread-এ চালালে ব্লক হবে না)
+            threading.Thread(target=ping_url, args=(mid, url, uid)).start()
+
+# ==============================
+# HELPERS (unchanged)
 # ==============================
 def get_ascii_graph(monitor_id):
     cursor = db_conn.cursor()
@@ -112,7 +133,7 @@ def main_menu():
     return markup
 
 # ==============================
-# HANDLERS
+# HANDLERS (unchanged)
 # ==============================
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -158,7 +179,8 @@ def process_url_input(message):
         return bot.send_message(message.chat.id, "❌ Error: Invalid URL format.")
     
     cursor = db_conn.cursor()
-    cursor.execute("INSERT INTO monitors (user_id, url, interval) VALUES (?, ?, ?)", (message.from_user.id, url, 0))
+    cursor.execute("INSERT INTO monitors (user_id, url, interval, last_checked) VALUES (?, ?, ?, ?)", 
+                   (message.from_user.id, url, 0, datetime.now()))
     db_conn.commit()
     row_id = cursor.lastrowid
     
@@ -176,7 +198,7 @@ def process_interval_input(message, row_id, url):
     cursor.execute("UPDATE monitors SET interval = ? WHERE id = ?", (minutes, row_id))
     db_conn.commit()
 
-    scheduler.add_job(ping_url, "interval", minutes=minutes, args=[row_id, url, message.from_user.id], id=f"job_{row_id}")
+    # No scheduler job now; last_checked will be set when first check happens
     bot.send_message(message.chat.id, f"✅ *Success!*\nMonitoring `{url}` every {minutes} minutes.", reply_markup=main_menu())
 
 @bot.callback_query_handler(func=lambda call: call.data == "list")
@@ -224,8 +246,6 @@ def delete_monitor(call):
     cursor.execute("DELETE FROM monitors WHERE id=?", (mid,))
     cursor.execute("DELETE FROM logs WHERE monitor_id=?", (mid,))
     db_conn.commit()
-    try: scheduler.remove_job(f"job_{mid}")
-    except: pass
     bot.answer_callback_query(call.id, "Deleted.")
     show_list(call)
 
@@ -234,7 +254,7 @@ def go_home(call):
     bot.edit_message_text("✅ *Uptime Monitor Dashboard*", call.message.chat.id, call.message.message_id, reply_markup=main_menu(), parse_mode="Markdown")
 
 # ==============================
-# WEBHOOK & HTTP SERVER
+# HTTP SERVER (handles both webhook and cron)
 # ==============================
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -242,6 +262,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"Bot is Running")
+        elif self.path == '/cron':
+            # external cron hits this endpoint
+            run_cron_tasks()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Cron tasks executed")
         else:
             self.send_error(404)
     
@@ -250,7 +276,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length)
             try:
-                # Parse incoming update and pass to bot
                 update = telebot.types.Update.de_json(json.loads(post_data))
                 bot.process_new_updates([update])
                 self.send_response(200)
@@ -270,17 +295,8 @@ def run_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Start the HTTP server in a background thread
+    # Start HTTP server (daemon thread)
     threading.Thread(target=run_server, daemon=True).start()
-    
-    # Load existing monitors into scheduler
-    cursor = db_conn.cursor()
-    cursor.execute("SELECT id, url, interval, user_id FROM monitors WHERE interval > 0")
-    for r in cursor.fetchall():
-        try:
-            scheduler.add_job(ping_url, "interval", minutes=r[2], args=[r[0], r[1], r[3]], id=f"job_{r[0]}")
-        except:
-            pass
 
     # Set Telegram webhook
     webhook_url = os.environ.get('WEBHOOK_URL')
@@ -288,20 +304,17 @@ if __name__ == "__main__":
         print("ERROR: WEBHOOK_URL environment variable is not set. Exiting.")
         sys.exit(1)
     
-    # Ensure the URL ends with '/webhook'
     if not webhook_url.endswith('/webhook'):
         webhook_url = webhook_url.rstrip('/') + '/webhook'
     
-    # Remove any existing webhook and set the new one
     bot.remove_webhook()
     time.sleep(1)
     bot.set_webhook(url=webhook_url)
-    print(f"Webhook successfully set to: {webhook_url}")
-    
-    # Keep the main thread alive (server runs in daemon thread)
+    print(f"Webhook set to: {webhook_url}")
+
+    # Keep main thread alive (server runs in daemon)
     try:
         while True:
             time.sleep(10)
     except KeyboardInterrupt:
         print("Shutting down...")
-        scheduler.shutdown()
